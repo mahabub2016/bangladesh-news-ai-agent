@@ -2,15 +2,9 @@ name: Bangladesh News Daily Digest
 
 on:
   schedule:
-    # GitHub Actions cron is UTC-only and can't express "7:00 AM America/New_York"
-    # directly, since that shifts between 11:00 UTC (EDT, roughly mid-March to
-    # early November) and 12:00 UTC (EST, the rest of the year). So this job
-    # fires at BOTH times every day, and the "Check local time" step below
-    # exits early on whichever run doesn't actually correspond to 7:00 AM
-    # America/New_York -- effectively auto-switching for daylight saving.
     - cron: "0 11 * * *" # candidate run: 7:00 AM EDT
     - cron: "0 12 * * *" # candidate run: 7:00 AM EST
-  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab (always runs, bypasses the time check)
+  workflow_dispatch: {}
 
 jobs:
   send-digest:
@@ -40,17 +34,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: bangladesh-news-ai-agent/package-lock.json
 
       - name: Install dependencies
         if: steps.time_check.outputs.should_run == 'true'
-        working-directory: bangladesh-news-ai-agent
         run: npm install
 
       - name: Run Bangladesh News AI Agent
         if: steps.time_check.outputs.should_run == 'true'
-        working-directory: bangladesh-news-ai-agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
