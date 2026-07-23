@@ -7,12 +7,20 @@ const parser = new Parser({
   },
 });
 
+function googleNewsUrl(query) {
+  return `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=bn&gl=BD&ceid=BD:bn`;
+}
+
+// Google News aggregates Bangla-language Bangladesh coverage from many
+// outlets (Prothom Alo, Kaler Kantho, Jugantor, Samakal, etc.) and, unlike
+// most individual Bangladeshi news sites, does not block requests coming
+// from cloud/CI servers like GitHub Actions.
 const FEEDS = [
   { name: "প্রথম আলো", url: "https://www.prothomalo.com/feed/" },
-  { name: "কালের কণ্ঠ", url: "https://www.kalerkantho.com/rss.xml" },
-  { name: "যুগান্তর", url: "https://www.jugantor.com/feed/rss.xml" },
-  { name: "বাংলানিউজ২৪", url: "https://www.banglanews24.com/rss/rss.xml" },
-  { name: "দ্য ডেইলি স্টার বাংলা", url: "https://bangla.thedailystar.net/rss" },
+  { name: "Google News - বাংলাদেশ", url: "https://news.google.com/rss?hl=bn&gl=BD&ceid=BD:bn" },
+  { name: "Google News - জাতীয়", url: googleNewsUrl("বাংলাদেশ জাতীয়") },
+  { name: "Google News - রাজনীতি", url: googleNewsUrl("বাংলাদেশ রাজনীতি") },
+  { name: "Google News - অর্থনীতি", url: googleNewsUrl("বাংলাদেশ অর্থনীতি") },
 ];
 
 async function fetchFeed(feed) {
@@ -31,7 +39,7 @@ async function fetchFeed(feed) {
   }
 }
 
-async function fetchAllNews(limit = 30) {
+async function fetchAllNews(limit = 40) {
   const results = await Promise.all(FEEDS.map(fetchFeed));
   const allItems = results.flat();
 
