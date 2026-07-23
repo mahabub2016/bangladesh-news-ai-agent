@@ -1,0 +1,314 @@
+// src/fetchNews.js
+// Fetches recent headlines from a curated list of Bangladesh English-language
+// news RSS feeds. Every feed is fetched independently and wrapped in a
+// try/catch so a single dead/renamed feed never crashes the whole run.
+
+const Parser = require("rss-parser");
+
+const parser = new Parser({
+  timeout: 15000,
+  headers: {
+    // Some BD news sites block requests with no browser-like User-Agent.
+    "User-Agent":
+      "Mozilla/5.0 (compatible; BangladeshNewsAgent/1.0; +https://github.com/mahabub2016)",
+  },
+});
+
+// Curated list of Bangladesh Bangla-language news RSS feeds.
+// If a source renames/retires its feed, just update the URL here --
+// nothing else in the project needs to change.
+const FEEDS = [
+  { name: "প্রথম আলো", url: "https://www.prothomalo.com/feed/" },
+  { name: "কালের কণ্ঠ", url: "https://www.kalerkantho.com/rss.xml" },
+  { name: "যুগান্তর", url: "https://www.jugantor.com/feed/rss.xml" },
+  { name: "বাংলানিউজ২৪", url: "https://www.banglanews24.com/rss/rss.xml" },
+  { name: "দ্য ডেইলি স্টার বাংলা", url: "https://bangla.thedailystar.net/rss" },
+];
+
+/**
+ * Fetch a single RSS feed and normalize its items.
+ */
+async function fetchFeed(feed) {
+  try {
+    const parsed = await parser.parseURL(feed.url);
+    return (parsed.items || []).map((item) => ({
+      title: (item.title || "").trim(),
+      link: item.link || "",
+      pubDate: item.pubDate ? new Date(item.pubDate) : null,
+      snippet: (item.contentSnippet || item.content || "").replace(/\s+/g, " ").trim(),
+      source: feed.name,
+    }));
+  } catch (err) {
+    console.warn(`[fetchNews] Skipping "${feed.name}" (${feed.url}): ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Fetch all configured feeds in parallel, merge, dedupe by normalized title,
+ * sort newest-first, and return the most recent `limit` items as raw
+ * candidates for the summarizer to pick the real top 10 from.
+ */
+async function fetchAllNews(limit = 30) {
+  const results = await Promise.all(FEEDS.map(fetchFeed));
+  const allItems = results.flat();
+
+  if (allItems.length === 0) {
+    throw new Error(
+      "No news items were fetched from any source. All RSS feeds failed or returned empty."
+    );
+  }
+
+  // Dedupe: different feeds sometimes carry the same wire story with a
+  // near-identical title. Normalize and drop repeats, keeping the first seen.
+  const seen = new Set();
+  const deduped = [];
+  for (const item of allItems) {
+    if (!item.title) continue;
+    const key = item.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  // Newest first (items with no parseable date sink to the bottom).
+  deduped.sort((a, b) => (b.pubDate?.getTime() || 0) - (a.pubDate?.getTime() || 0));
+
+  return deduped.slice(0, limit);
+}
+
+module.exports = { fetchAllNews, FEEDS };
+
+// src/index.js
+// Entry point: fetch -> summarize (Claude) -> email.
+// Run locally with `npm start` (after setting up .env), or automatically
+// every morning via the GitHub Actions workflow in .github/workflows/.
+
+require("dotenv").config();
+
+const { fetchAllNews } = require("./fetchNews");
+const { summarizeTopStories } = require("./summarize");
+const { sendDigestEmail } = require("./sendEmail");
+
+async function main() {
+  console.log("[1/3] Fetching Bangladesh news from RSS feeds...");
+  const candidates = await fetchAllNews(30);
+  console.log(`      Collected ${candidates.length} candidate headlines.`);
+
+  console.log("[2/3] Asking Claude to pick and summarize the top 10 stories...");
+  const stories = await summarizeTopStories(candidates);
+  console.log(`      Got ${stories.length} summarized stories.`);
+
+  console.log("[3/3] Sending digest email...");
+  await sendDigestEmail(stories);
+  console.log("      Email sent successfully.");
+
+  console.log("Done.");
+}
+
+main().catch((err) => {
+  console.error("Bangladesh News AI Agent failed:", err);
+  process.exit(1);
+});
+
+// src/sendEmail.js
+// Builds and sends the daily digest email via Gmail SMTP (using an app
+// password, not the real Gmail password).
+
+const nodemailer = require("nodemailer");
+
+const RECIPIENT = process.env.DIGEST_RECIPIENT || "ai.token.mahabub@gmail.com";
+
+function formatDateForSubject() {
+  return new Date().toLocaleDateString("bn-BD", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: "America/New_York",
+  });
+}
+
+function escapeHtml(str = "") {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildHtml(stories, dateStr) {
+  const rows = stories
+    .map((s, i) => {
+      const title = escapeHtml(s.title || "শিরোনাম নেই");
+      const summary = escapeHtml(s.summary || "");
+      const source = escapeHtml(s.source || "");
+      const link = s.link || "#";
+      return `
+        <tr>
+          <td style="padding:18px 0;border-bottom:1px solid #e5e5e5;">
+            <div style="font-size:12px;letter-spacing:.04em;color:#0a7a4b;font-weight:600;margin-bottom:4px;">
+              ${i + 1}. ${source}
+            </div>
+            <div style="font-size:17px;font-weight:700;color:#1a1a1a;margin-bottom:6px;line-height:1.4;">
+              ${title}
+            </div>
+            <div style="font-size:14px;color:#3d3d3d;line-height:1.7;margin-bottom:8px;">
+              ${summary}
+            </div>
+            <a href="${link}" style="font-size:13px;color:#0a7a4b;text-decoration:none;font-weight:600;">
+              বিস্তারিত পড়ুন &rarr;
+            </a>
+          </td>
+        </tr>`;
+    })
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="bn">
+  <body style="margin:0;padding:0;background-color:#f4f4f4;font-family:'Noto Sans Bengali','Nirmala UI',Georgia,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f4;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:8px;overflow:hidden;">
+            <tr>
+              <td style="background-color:#0a7a4b;padding:24px 28px;">
+                <div style="color:#ffffff;font-size:20px;font-weight:700;">🇧🇩 বাংলাদেশ সংবাদ সংক্ষিপ্তসার</div>
+                <div style="color:#d7f0e3;font-size:13px;margin-top:4px;">${dateStr}</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:8px 28px 4px 28px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                  ${rows}
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:20px 28px 28px 28px;font-size:11px;color:#999;">
+                প্রতিদিন সকালে আপনার Bangladesh News AI Agent (Claude + GitHub Actions) দ্বারা স্বয়ংক্রিয়ভাবে তৈরি। সারসংক্ষেপগুলো পাবলিক RSS হেডলাইন থেকে AI দ্বারা তৈরি, তাই সম্পূর্ণ বিস্তারিত জানতে মূল লিংকে যান।
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+function buildPlainText(stories, dateStr) {
+  const lines = stories.map((s, i) => {
+    return `${i + 1}. ${s.title} (${s.source})\n${s.summary}\nবিস্তারিত: ${s.link}\n`;
+  });
+  return `বাংলাদেশ সংবাদ সংক্ষিপ্তসার -- ${dateStr}\n\n${lines.join("\n")}`;
+}
+
+async function sendDigestEmail(stories) {
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+
+  if (!user || !pass) {
+    throw new Error("Missing GMAIL_USER or GMAIL_APP_PASSWORD environment variable / secret.");
+  }
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user, pass },
+  });
+
+  const dateStr = formatDateForSubject();
+
+  await transporter.sendMail({
+    from: `"Bangladesh News AI Agent" <${user}>`,
+    to: RECIPIENT,
+    subject: `🇧🇩 বাংলাদেশ সংবাদ সংক্ষিপ্তসার -- ${dateStr}`,
+    text: buildPlainText(stories, dateStr),
+    html: buildHtml(stories, dateStr),
+  });
+}
+
+module.exports = { sendDigestEmail };
+
+// src/summarize.js
+// Sends the raw headline candidates to Claude and asks it to pick the top 10
+// most significant Bangladesh stories and write a tight 2-3 sentence summary
+// for each, using only the supplied snippet (no fabrication).
+
+const Anthropic = require("@anthropic-ai/sdk");
+
+const MODEL = "claude-sonnet-4-6";
+
+function buildPrompt(candidates) {
+  const list = candidates
+    .map((c, i) => {
+      return [
+        `[${i + 1}]`,
+        `Title: ${c.title}`,
+        `Source: ${c.source}`,
+        `Link: ${c.link}`,
+        `Snippet: ${c.snippet || "(no snippet available)"}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+
+  return `You are curating a daily Bangladesh news digest for a busy professional. The digest must be written entirely in Bangla (বাংলা), in standard/formal written Bengali (লেখ্য বাংলা), regardless of the language of the source snippets below.
+
+Below are recent headlines pulled from multiple Bangla-language Bangladesh news outlets (প্রথম আলো, কালের কণ্ঠ, যুগান্তর, বাংলানিউজ২৪, দ্য ডেইলি স্টার বাংলা). Some may be duplicates covering the same story, low-importance filler, or non-news content (ads, section labels). Your job:
+
+1. Select the 10 most significant, genuinely newsworthy stories about Bangladesh (জাতীয় সংবাদ, রাজনীতি, অর্থনীতি, এবং বাংলাদেশ সম্পর্কিত গুরুত্বপূর্ণ আন্তর্জাতিক সংবাদ)। Prefer national significance over celebrity/entertainment gossip unless nothing else qualifies.
+2. If two entries clearly cover the same underlying story, treat them as one and pick the better-sourced link.
+3. For each selected story, write the title and a clear, neutral 2-3 sentence summary IN BANGLA, based ONLY on the title and snippet given below. If the source text is already in Bangla, keep it in Bangla; do not translate into English. Do not invent facts, numbers, or quotes that are not implied by the source text.
+4. Keep each summary objective and concise -- no editorializing.
+
+Candidates:
+
+${list}
+
+Respond with ONLY a JSON array (no markdown fences, no preamble/explanation) of exactly 10 objects, ordered by importance, in this exact shape. All "title" and "summary" values must be written in Bangla:
+[
+  {"title": "string (Bangla)", "summary": "2-3 sentence summary (Bangla)", "link": "string", "source": "string"}
+]`;
+}
+
+/**
+ * Ask Claude to pick and summarize the top 10 stories from the candidate list.
+ * Returns an array of { title, summary, link, source }.
+ */
+async function summarizeTopStories(candidates) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error("Missing ANTHROPIC_API_KEY environment variable / secret.");
+  }
+
+  const client = new Anthropic({ apiKey });
+
+  const response = await client.messages.create({
+    model: MODEL,
+    max_tokens: 2000,
+    messages: [{ role: "user", content: buildPrompt(candidates) }],
+  });
+
+  const textBlock = response.content.find((block) => block.type === "text");
+  if (!textBlock) {
+    throw new Error("Claude response did not contain a text block.");
+  }
+
+  // Defensive cleanup in case the model wraps output in markdown fences anyway.
+  const cleaned = textBlock.text.replace(/^```json\s*|^```\s*|```$/gm, "").trim();
+
+  let stories;
+  try {
+    stories = JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error(`Failed to parse Claude's JSON response: ${err.message}\nRaw: ${cleaned}`);
+  }
+
+  if (!Array.isArray(stories) || stories.length === 0) {
+    throw new Error("Claude did not return a non-empty array of stories.");
+  }
+
+  return stories;
+}
+
+module.exports = { summarizeTopStories };
